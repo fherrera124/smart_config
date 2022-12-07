@@ -1,0 +1,1 @@
+idf_component_register(SRCS "spiffs.c" "smartconfig_main.c")
