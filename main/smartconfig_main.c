@@ -5,7 +5,7 @@
  * sea posible. Para ello intenta de obtener desde el almacenamiento flash la
  * configuracion de una red almacenada, utilizando el sistema de archivos spiffs.
  * - Si encuentra el archivo: Lo lee y trata de conectarse a la red especificada
- *   en el archivo un máximo de ESP_MAXIMUM_RETRY, si no logra conectarse
+ *   en el archivo un máximo de MAXIMUM_RETRY, si no logra conectarse
  *   iniciará smartconfig.
  * - Si no encuentra el archivo: Iniciará smartconfig.
  *
@@ -18,7 +18,7 @@
  * - Si no son proporcionadas a tiempo (timeout), se reinicia el dispositivo y
  *   comienza nuevamente todo el proceso.
  *
- * Siempre que la conexion se pierda, intentará unas ESP_MAXIMUM_RETRY veces para
+ * Siempre que la conexion se pierda, intentará unas MAXIMUM_RETRY veces para
  * volver a conectarse, caso fallido, iniciará smartconfig.
  *
  * @version 0.1
@@ -57,7 +57,8 @@ extern int wifi_config_write(wifi_config_t* wifi_config);
 extern int wifi_config_delete();
 
 /* Private macro -------------------------------------------------------------*/
-#define ESP_MAXIMUM_RETRY      5
+#define MAXIMUM_RETRY          5
+#define WAIT_AFTER_RETRY       pdMS_TO_TICKS(5000)
 #define SMARTCONFIG_WAIT_TICKS pdMS_TO_TICKS(30000)
 
 /* Private variables ---------------------------------------------------------*/
@@ -95,9 +96,10 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
             xTaskCreate(conn_task, "smartconfig", 4096, NULL, 3, NULL);
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
-            if (s_retry_num++ < ESP_MAXIMUM_RETRY) {
+            if (s_retry_num++ < MAXIMUM_RETRY) {
                 ESP_LOGI(TAG, "retry to connect to the AP");
                 esp_wifi_connect();
+                vTaskDelay(WAIT_AFTER_RETRY);
                 break;
             }
             ESP_LOGE(TAG, "connect to the AP fail, max retries reached. Start smartconfig");
