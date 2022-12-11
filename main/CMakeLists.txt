@@ -1,1 +1,1 @@
-idf_component_register(SRCS "spiffs.c" "smartconfig_main.c")
+idf_component_register(SRCS "spiffs_wifi.c" "smartconfig_main.c")

@@ -5,21 +5,24 @@
  * sea posible. Para ello intenta de obtener desde el almacenamiento flash la
  * configuracion de una red almacenada, utilizando el sistema de archivos spiffs.
  * - Si encuentra el archivo: Lo lee y trata de conectarse a la red especificada
- *   en el archivo un máximo de MAXIMUM_RETRY, si no logra conectarse
+ *   en el archivo un número máximo especificado de intentos. Si no lo logra
  *   iniciará smartconfig.
  * - Si no encuentra el archivo: Iniciará smartconfig.
  *
- * Smartconfig: si se encuentra en dicho modo, el dispositivo esperará
- * SMARTCONFIG_WAIT_TICKS para que una persona envie las credenciales usando la
- * aplicacion SmartTouch de espressif.
+ * Smartconfig: si se encuentra en dicho modo, el dispositivo esperará un
+ * tiempo determinado por credenciales desde la aplicacion SmartTouch de espressif.
  *
- * - Si son proporcionadas, dichas credenciales se almacenaran en la memoria flash,
- *   reemplazando las ya existentes, de ser el caso. Luego intentará conectarse.
- * - Si no son proporcionadas a tiempo (timeout), se reinicia el dispositivo y
- *   comienza nuevamente todo el proceso.
+ * - Si son proporcionadas: intentará conectarse.
+ *   - Si logra conectarse: dichas credenciales se almacenarán en la memoria
+ *     flash, reemplazando las anteriores, en caso de existir.
+ *   - Si no logra conectarse: luego de alcanzar el número máximo de intentos,
+ *     reiniciará.
  *
- * Siempre que la conexion se pierda, intentará unas MAXIMUM_RETRY veces para
- * volver a conectarse, caso fallido, iniciará smartconfig.
+ * - Si no son proporcionadas (timeout): se reinicia el dispositivo y comienza
+ *   nuevamente todo el proceso.
+ *
+ * Nota: Siempre que la conexion se pierda, intentará volver a conectarse un
+ * máximo especificado de intentos. Si no lo logra iniciará smartconfig.
  *
  * @version 0.1
  * @date 2022-12-06
@@ -29,6 +32,10 @@
  */
 
 /* Includes ------------------------------------------------------------------*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -37,39 +44,34 @@
 #include "esp_wifi.h"
 #include "esp_wpa2.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "spiffs_wifi.h"
 
 /* Private function prototypes -----------------------------------------------*/
-static void conn_task(void* parm);
+static void smartconfig_task(void* parm);
 static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static void initialise_wifi(void);
-static void conn_task(void* parm);
-
-/* Extern function definitions -----------------------------------------------*/
-extern int wifi_config_read(wifi_config_t* wifi_config);
-extern int wifi_config_write(wifi_config_t* wifi_config);
-extern int wifi_config_delete();
 
 /* Private macro -------------------------------------------------------------*/
-#define MAXIMUM_RETRY          5
-#define WAIT_AFTER_RETRY       pdMS_TO_TICKS(5000)
-#define SMARTCONFIG_WAIT_TICKS pdMS_TO_TICKS(30000)
+#define MAXIMUM_RETRY    3
+#define WAIT_AFTER_RETRY pdMS_TO_TICKS(5000) // WAIT_AFTER_RETRY must be smaller than WAIT_FOR_EVENT
+#define WAIT_FOR_EVENT   pdMS_TO_TICKS(40000)
+#define NOTIFY_TASK(event) \
+    if (smartconfig_mode)  \
+        xTaskNotify(task_handle, event, eSetValueWithOverwrite);
 
 /* Private variables ---------------------------------------------------------*/
 static const char*   TAG = "smartconfig_example";
-static int           s_retry_num = 0;
-static bool          s_start_smartconfig = false;
+static int           retry_num = 0;
+static bool          smartconfig_mode = false;
 static wifi_config_t wifi_config = { 0 };
+static TaskHandle_t  task_handle = NULL;
 
-static EventGroupHandle_t s_wifi_event_group;
-static const int          CONNECTED_BIT = BIT0;
-static const int          ESPTOUCH_DONE_BIT = BIT1;
+static const int CONNECTED_BIT = BIT0;
+static const int ESPTOUCH_DONE_BIT = BIT1;
+static const int RETRIED_BIT = BIT2;
 
 /* Exported functions --------------------------------------------------------*/
 void app_main(void)
@@ -93,26 +95,31 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
         case WIFI_EVENT_STA_START:
-            xTaskCreate(conn_task, "smartconfig", 4096, NULL, 3, NULL);
+            smartconfig_mode ? xTaskCreate(smartconfig_task, "smartconfig", 4096, NULL, 3, &task_handle)
+                             : esp_wifi_connect();
             break;
         case WIFI_EVENT_STA_DISCONNECTED:
-            if (s_retry_num++ < MAXIMUM_RETRY) {
+            if (retry_num++ < MAXIMUM_RETRY) {
                 ESP_LOGI(TAG, "retry to connect to the AP");
                 esp_wifi_connect();
                 vTaskDelay(WAIT_AFTER_RETRY);
+                NOTIFY_TASK(RETRIED_BIT);
                 break;
             }
-            ESP_LOGE(TAG, "connect to the AP fail, max retries reached. Start smartconfig");
-            xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
-            s_start_smartconfig = true;
-            xTaskCreate(conn_task, "conn_task", 4096, NULL, 3, NULL);
+            if (smartconfig_mode) {
+                ESP_LOGE(TAG, "Failed smartconfig. Wrong credentials or AP unreachable. Restarting");
+                esp_restart();
+            };
+            smartconfig_mode = true;
+            ESP_LOGE(TAG, "Wrong credentials or AP unreachable. Start smartconfig");
+            xTaskCreate(smartconfig_task, "smartconfig_task", 4096, NULL, 3, &task_handle);
             break;
         }
 
     } else if (event_base == IP_EVENT) {
         if (event_id == IP_EVENT_STA_GOT_IP) {
-            s_retry_num = 0;
-            xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
+            retry_num = 0;
+            NOTIFY_TASK(CONNECTED_BIT);
         }
 
     } else if (event_base == SC_EVENT) {
@@ -138,19 +145,16 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
             wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
             wifi_config.sta.bssid_set = evt->bssid_set;
-            if (wifi_config.sta.bssid_set == true) {
+            if (wifi_config.sta.bssid_set) {
                 memcpy(wifi_config.sta.bssid, evt->bssid, sizeof(wifi_config.sta.bssid));
             }
-            wifi_config_write(&wifi_config);
-            ESP_LOGI(TAG, "SSID:%s", wifi_config.sta.ssid);
-            ESP_LOGI(TAG, "PASSWORD:%s", wifi_config.sta.password);
 
             ESP_ERROR_CHECK(esp_wifi_disconnect());
             ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
             esp_wifi_connect();
             break;
         case SC_EVENT_SEND_ACK_DONE:
-            xEventGroupSetBits(s_wifi_event_group, ESPTOUCH_DONE_BIT);
+            NOTIFY_TASK(ESPTOUCH_DONE_BIT);
             break;
         }
     }
@@ -159,7 +163,6 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
 static void initialise_wifi(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
-    s_wifi_event_group = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
@@ -172,43 +175,40 @@ static void initialise_wifi(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    int err = wifi_config_read(&wifi_config);
-
-    if (err == 0) {
+    if (CONFIG_FOUND == wifi_config_read(&wifi_config)) {
+        ESP_LOGI(TAG, "Recovered credentials from flash memory");
         ESP_LOGD(TAG, "saved ssid: %s saved password: %s\n", wifi_config.sta.ssid, wifi_config.sta.password);
         ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
     } else {
-        s_start_smartconfig = true;
+        smartconfig_mode = true;
     }
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
-static void conn_task(void* parm)
+static void smartconfig_task(void* parm)
 {
-    if (s_start_smartconfig) {
-        ESP_ERROR_CHECK(esp_smartconfig_set_type(SC_TYPE_ESPTOUCH));
-        smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_smartconfig_start(&cfg));
-    } else {
-        esp_wifi_connect();
-    }
-    EventBits_t uxBits;
+    ESP_ERROR_CHECK(esp_smartconfig_set_type(SC_TYPE_ESPTOUCH));
+    smartconfig_start_config_t cfg = SMARTCONFIG_START_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_smartconfig_start(&cfg));
 
-    while (1) {
-        uxBits = xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT | ESPTOUCH_DONE_BIT,
-            true, false, SMARTCONFIG_WAIT_TICKS);
-        if (uxBits & CONNECTED_BIT) {
+    uint32_t notif;
+
+    do {
+        switch (notif) {
+        case CONNECTED_BIT:
             ESP_LOGI(TAG, "WiFi Connected to ap");
-            if (s_start_smartconfig == false) {
-                vTaskDelete(NULL);
-            }
-        } else if (uxBits & ESPTOUCH_DONE_BIT) {
+            wifi_config_write(&wifi_config);
+            break;
+        case ESPTOUCH_DONE_BIT:
             ESP_LOGI(TAG, "smartconfig over");
             esp_smartconfig_stop();
+            smartconfig_mode = false;
             vTaskDelete(NULL);
-        } else {
-            ESP_LOGW(TAG, "Timeout waiting for connection. Restarting");
-            esp_restart();
+            return;
+        case RETRIED_BIT:
+            break;
         }
-    }
+    } while (xTaskNotifyWait(pdFALSE, ULONG_MAX, &notif, WAIT_FOR_EVENT));
+    ESP_LOGW(TAG, "Timeout waiting for connection. Restarting");
+    esp_restart();
 }
