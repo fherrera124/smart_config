@@ -193,7 +193,7 @@ static void smartconfig_task(void* parm)
 
     uint32_t notif;
 
-    do {
+    while (xTaskNotifyWait(pdFALSE, ULONG_MAX, &notif, WAIT_FOR_EVENT)) {
         switch (notif) {
         case CONNECTED_BIT:
             ESP_LOGI(TAG, "WiFi Connected to ap");
@@ -208,7 +208,7 @@ static void smartconfig_task(void* parm)
         case RETRIED_BIT:
             break;
         }
-    } while (xTaskNotifyWait(pdFALSE, ULONG_MAX, &notif, WAIT_FOR_EVENT));
+    }
     ESP_LOGW(TAG, "Timeout waiting for connection. Restarting");
     esp_restart();
 }
